@@ -191,6 +191,18 @@ class ProductionMultiCameraApp:
             coal_consecutive_threshold=cam.detection.coal_consecutive_threshold,
             coal_no_blockage_threshold=cam.detection.coal_no_blockage_threshold,
             detection_confidence=cam.detection.confidence_threshold,
+            # PLC config (mỗi camera có PLC riêng)
+            plc_ip=cam.plc.ip,
+            plc_rack=cam.plc.rack,
+            plc_slot=cam.plc.slot,
+            plc_db_number=cam.plc.db_number,
+            plc_person_byte=cam.plc.person_alarm_byte,
+            plc_person_bit=cam.plc.person_alarm_bit,
+            plc_coal_byte=cam.plc.coal_alarm_byte,
+            plc_coal_bit=cam.plc.coal_alarm_bit,
+            # Logging config
+            logs_dir=self.config.logs_dir,
+            artifacts_dir=self.config.artifacts_dir,
             target_capture_fps=cam.target_fps,
             detection_interval=0.5,  # 2 FPS detection
             buffer_size=1,  # Low latency

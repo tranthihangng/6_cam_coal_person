@@ -28,8 +28,8 @@
             },
             "roi": {
                 "reference_resolution": [
-                    1920,
-                    1080
+                    1280,
+                    720
                 ],
                 "roi_person": [
                     [
@@ -126,8 +126,8 @@
             },
             "roi": {
                 "reference_resolution": [
-                    1920,
-                    1080
+                    1280,
+                    720
                 ],
                 "roi_person": [
                     [
@@ -224,8 +224,8 @@
             },
             "roi": {
                 "reference_resolution": [
-                    1920,
-                    1080
+                    1280,
+                    720
                 ],
                 "roi_person": [
                     [
@@ -322,8 +322,8 @@
             },
             "roi": {
                 "reference_resolution": [
-                    1920,
-                    1080
+                    1280,
+                    720
                 ],
                 "roi_person": [
                     [
@@ -420,8 +420,8 @@
             },
             "roi": {
                 "reference_resolution": [
-                    1920,
-                    1080
+                    1280,
+                    720
                 ],
                 "roi_person": [
                     [
@@ -518,8 +518,8 @@
             },
             "roi": {
                 "reference_resolution": [
-                    1920,
-                    1080
+                    1280,
+                    720
                 ],
                 "roi_person": [
                     [

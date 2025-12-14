@@ -61,6 +61,7 @@ class CameraPanel(tk.Frame):
         self.connection_status = "offline"
         self.fps = 0.0
         self.coal_ratio = 0.0
+        self.person_detected = False
         self.person_alarm = False
         self.coal_alarm = False
         
@@ -95,7 +96,7 @@ class CameraPanel(tk.Frame):
         footer.pack(fill=tk.X)
         footer.pack_propagate(False)
         
-        self.info_lbl = tk.Label(footer, text="FPS: -- | Than: --%", font=(FONT, 8),
+        self.info_lbl = tk.Label(footer, text="FPS: -- | Than: --% | Người: --", font=(FONT, 8),
                                  bg=COLORS['bg_panel'], fg=COLORS['text_gray'])
         self.info_lbl.pack(side=tk.LEFT, padx=5)
     
@@ -110,10 +111,11 @@ class CameraPanel(tk.Frame):
         with self._frame_lock:
             self._display_frame = frame
     
-    def update_stats(self, fps: float, coal_ratio: float):
+    def update_stats(self, fps: float, coal_ratio: float, person_detected: bool = False):
         """Cập nhật thống kê"""
         self.fps = fps
         self.coal_ratio = coal_ratio
+        self.person_detected = person_detected
     
     def set_alarm(self, person: bool, coal: bool):
         """Set trạng thái alarm"""
@@ -142,7 +144,7 @@ class CameraPanel(tk.Frame):
         self.status_lbl.config(text=text, fg=color)
     
     def process_display(self):
-        """Xử lý và hiển thị frame (gọi từ main thread)"""
+        """Xử lý và hiển thị frame (gọi từ main thread) - tham khảo coal_12_12_v1.py"""
         with self._frame_lock:
             if self._display_frame is None:
                 return
@@ -150,25 +152,69 @@ class CameraPanel(tk.Frame):
             self._display_frame = None
         
         try:
-            # Kích thước display
-            disp_w = self.width - 8
-            disp_h = self.height - 48
+            # Kiểm tra frame có hợp lệ không
+            if frame is None:
+                return
             
+            # Lấy kích thước thực tế của widget (không hardcode)
+            self.video_lbl.update_idletasks()
+            parent = self.video_lbl.master  # CameraPanel frame
+            parent.update_idletasks()
+            
+            # Lấy kích thước khung hình camera (trừ padding)
+            max_width = parent.winfo_width() - 8  # Trừ padding
+            max_height = parent.winfo_height() - 48  # Trừ header và footer
+            
+            # Nếu chưa có kích thước hợp lệ, dùng giá trị từ config
+            if max_width < 100 or max_height < 100:
+                max_width = self.width - 8
+                max_height = self.height - 48
+            
+            # Lấy kích thước gốc của frame
             h, w = frame.shape[:2]
-            scale = min(disp_w / w, disp_h / h)
-            new_w, new_h = int(w * scale), int(h * scale)
             
-            # Resize
-            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            # Kiểm tra frame có hợp lệ không
+            if w <= 0 or h <= 0:
+                return
             
-            # Canvas với video ở giữa
-            canvas = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
-            y_off = (disp_h - new_h) // 2
-            x_off = (disp_w - new_w) // 2
-            canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
+            # Tính tỷ lệ scale để giữ nguyên aspect ratio
+            scale_x = max_width / w
+            scale_y = max_height / h
+            scale = min(scale_x, scale_y)  # Lấy scale nhỏ hơn để fit hoàn toàn
             
-            # Vẽ overlay
-            self._draw_overlay(canvas, w, h, new_w, new_h, x_off, y_off)
+            # Giới hạn scale để tránh quá nhỏ hoặc quá lớn
+            scale = max(0.1, min(scale, 3.0))
+            
+            # Tính kích thước mới
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            # Đảm bảo kích thước mới không quá nhỏ
+            if new_w < 10 or new_h < 10:
+                new_w = max(10, new_w)
+                new_h = max(10, new_h)
+            
+            # Resize frame với interpolation tốt
+            if scale < 1.0:
+                # Thu nhỏ - dùng INTER_AREA để tránh aliasing
+                frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                # Phóng to - dùng INTER_LINEAR
+                frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
+            # Tạo canvas với video ở giữa (nền đen)
+            canvas = np.zeros((max_height, max_width, 3), dtype=np.uint8)
+            
+            # Căn giữa video trong khung hình
+            y_off = (max_height - new_h) // 2
+            x_off = (max_width - new_w) // 2
+            
+            # Đảm bảo offset không âm
+            y_off = max(0, y_off)
+            x_off = max(0, x_off)
+            
+            # Đặt video đã resize vào giữa canvas
+            canvas[y_off:y_off+new_h, x_off:x_off+new_w] = frame_resized
             
             # Convert
             rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
@@ -176,43 +222,18 @@ class CameraPanel(tk.Frame):
             self.video_lbl.configure(image=self._photo, text='')
             
             # Info
-            self.info_lbl.config(text=f"FPS: {self.fps:.0f} | Than: {self.coal_ratio:.0f}%")
+            person_text = "Có" if self.person_detected else "Không"
+            self.info_lbl.config(text=f"FPS: {self.fps:.0f} | Than: {self.coal_ratio:.1f}% | Người: {person_text}")
             
         except Exception as e:
             pass
     
     def _draw_overlay(self, frame, orig_w, orig_h, new_w, new_h, x_off, y_off):
-        """Vẽ ROI và thông tin"""
+        """Vẽ ROI lên frame (nếu chưa có từ worker)"""
         try:
-            scale_x = new_w / orig_w
-            scale_y = new_h / orig_h
-            ref_w, ref_h = self.roi_reference
-            
-            def scale_pts(points):
-                return [(int(x * orig_w / ref_w * scale_x) + x_off,
-                        int(y * orig_h / ref_h * scale_y) + y_off) for x, y in points]
-            
-            # ROI người (vàng)
-            if self.roi_person and len(self.roi_person) >= 3:
-                pts = np.array(scale_pts(self.roi_person), np.int32)
-                cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
-            
-            # ROI than (đỏ)
-            if self.roi_coal and len(self.roi_coal) >= 3:
-                pts = np.array(scale_pts(self.roi_coal), np.int32)
-                cv2.polylines(frame, [pts], True, (0, 0, 255), 2)
-            
-            # Label camera
-            cv2.putText(frame, f"CAM {self.cam_id}", (5 + x_off, 20 + y_off),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            # Cảnh báo
-            if self.person_alarm:
-                cv2.putText(frame, "NGUOI!", (5 + x_off, 45 + y_off),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            if self.coal_alarm:
-                cv2.putText(frame, "TAC THAN!", (5 + x_off, 65 + y_off),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            # ROI đã được vẽ trong worker, không cần vẽ lại ở đây
+            # Chỉ giữ hàm này để tương thích
+            pass
         except:
             pass
 
@@ -243,6 +264,9 @@ class MainWindow:
         
         # Create UI
         self._create_ui()
+        
+        # Auto-start monitoring
+        self.root.after(1000, self._auto_start_monitoring)
         
         # GUI loop
         self._update_loop()
@@ -991,7 +1015,7 @@ class MainWindow:
             
             if frame is not None:
                 panel.update_frame(frame)
-                panel.update_stats(worker.fps_display, worker.last_coal_ratio)
+                panel.update_stats(worker.fps_display, worker.last_coal_ratio, worker.last_person_detected)
             
             # Process result nếu có
             result = worker.get_latest_result()
@@ -1020,6 +1044,11 @@ class MainWindow:
         """Run"""
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
+    
+    def _auto_start_monitoring(self):
+        """Tự động bắt đầu giám sát khi khởi động"""
+        if not self._is_monitoring:
+            self._start_monitoring()
     
     def _on_close(self):
         """Close"""

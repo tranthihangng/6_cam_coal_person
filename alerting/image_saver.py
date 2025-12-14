@@ -83,11 +83,13 @@ class ImageSaver:
         os.makedirs(artifacts_dir, exist_ok=True)
     
     def _get_daily_dir(self) -> str:
-        """Lấy thư mục theo ngày"""
+        """Lấy thư mục theo ngày và camera"""
         day = datetime.now().strftime("%Y%m%d")
         day_dir = os.path.join(self.artifacts_dir, day)
-        os.makedirs(day_dir, exist_ok=True)
-        return day_dir
+        # Tạo folder cho camera này (ví dụ: camera_1, camera_2, ...)
+        camera_dir = os.path.join(day_dir, self.camera_id)
+        os.makedirs(camera_dir, exist_ok=True)
+        return camera_dir
     
     def _should_save(self, alert_type: str) -> bool:
         """Kiểm tra có nên lưu không (throttling)"""

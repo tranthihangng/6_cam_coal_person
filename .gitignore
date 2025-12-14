@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs và Artifacts (file lớn, không cần commit)
+logs/
+artifacts/
+*.log
+
+# Model files (nếu quá lớn, có thể dùng Git LFS hoặc bỏ qua)
+# *.pt
+# *.onnx
+# *.pb
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Config files có thông tin nhạy cảm (uncomment nếu cần)
+# system_config.json
+# config/*.json
+
+# Docker
+.dockerignore
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+

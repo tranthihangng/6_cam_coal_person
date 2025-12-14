@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .inference_stats import get_stats_manager
+from ..plc import PLCClient, AlarmManager, AlarmConfig, AlarmType
+from ..alerting import AlertLogger, ImageSaver
 
 
 class WorkerStatus(Enum):
@@ -58,6 +60,20 @@ class WorkerConfig:
     coal_consecutive_threshold: int = 5
     coal_no_blockage_threshold: int = 5
     detection_confidence: float = 0.7
+    
+    # PLC config (mỗi camera có PLC riêng)
+    plc_ip: str = ""
+    plc_rack: int = 0
+    plc_slot: int = 2
+    plc_db_number: int = 300
+    plc_person_byte: int = 6
+    plc_person_bit: int = 0
+    plc_coal_byte: int = 6
+    plc_coal_bit: int = 1
+    
+    # Logging config
+    logs_dir: str = "logs"
+    artifacts_dir: str = "artifacts"
     
     # Performance config
     target_capture_fps: int = 25
@@ -181,6 +197,7 @@ class OptimizedCameraWorker:
         # Alarm state
         self.person_alarm_active = False
         self.coal_alarm_active = False
+        self.last_person_detected = False  # Track person detection state for display
         
         # Class IDs
         self.person_class_id = 0
@@ -188,6 +205,18 @@ class OptimizedCameraWorker:
         
         # Inference stats manager
         self._stats_manager = get_stats_manager()
+        
+        # PLC client (mỗi camera có PLC riêng)
+        self._plc_client: Optional[PLCClient] = None
+        self._alarm_manager: Optional[AlarmManager] = None
+        
+        # Logging
+        self._alert_logger: Optional[AlertLogger] = None
+        self._image_saver: Optional[ImageSaver] = None
+        
+        # Initialize PLC và logging
+        self._init_plc()
+        self._init_logging()
     
     # ===== PROPERTIES =====
     
@@ -217,6 +246,63 @@ class OptimizedCameraWorker:
     
     # ===== PUBLIC METHODS =====
     
+    def _init_plc(self) -> None:
+        """Khởi tạo PLC client (mỗi camera có PLC riêng)"""
+        if not self.config.plc_ip:
+            return
+        
+        try:
+            self._plc_client = PLCClient(
+                ip=self.config.plc_ip,
+                rack=self.config.plc_rack,
+                slot=self.config.plc_slot,
+                on_state_change=lambda state: self._log(f"PLC Cam{self.camera_id}: {state.value}"),
+                on_error=lambda msg: self._log(f"PLC Cam{self.camera_id} error: {msg}")
+            )
+            
+            # Tạo AlarmConfig
+            person_alarm_config = AlarmConfig()
+            person_alarm_config.db_number = self.config.plc_db_number
+            person_alarm_config.byte_offset = self.config.plc_person_byte
+            person_alarm_config.bit_offset = self.config.plc_person_bit
+            
+            coal_alarm_config = AlarmConfig()
+            coal_alarm_config.db_number = self.config.plc_db_number
+            coal_alarm_config.byte_offset = self.config.plc_coal_byte
+            coal_alarm_config.bit_offset = self.config.plc_coal_bit
+            
+            # Tạo AlarmManager
+            self._alarm_manager = AlarmManager(
+                plc_client=self._plc_client,
+                person_alarm=person_alarm_config,
+                coal_alarm=coal_alarm_config,
+            )
+            
+            # Kết nối PLC
+            if self._plc_client.connect():
+                self._log(f"✅ Camera {self.camera_id}: Đã kết nối PLC {self.config.plc_ip}")
+            else:
+                self._log(f"⚠️ Camera {self.camera_id}: Không thể kết nối PLC")
+        except Exception as e:
+            self._log(f"❌ Camera {self.camera_id}: Lỗi khởi tạo PLC - {str(e)}")
+    
+    def _init_logging(self) -> None:
+        """Khởi tạo logging"""
+        try:
+            camera_id_str = f"camera_{self.camera_id}"
+            self._alert_logger = AlertLogger(
+                logs_dir=self.config.logs_dir,
+                camera_id=camera_id_str,
+                camera_ip=self.config.rtsp_url,
+                location=self.config.camera_name,
+            )
+            self._image_saver = ImageSaver(
+                artifacts_dir=self.config.artifacts_dir,
+                camera_id=camera_id_str,
+            )
+        except Exception as e:
+            self._log(f"❌ Camera {self.camera_id}: Lỗi khởi tạo logging - {str(e)}")
+    
     def start(self) -> bool:
         """Bắt đầu worker"""
         if self._is_running:
@@ -229,6 +315,10 @@ class OptimizedCameraWorker:
         self._is_running = True
         self._stop_event.clear()
         self._status = WorkerStatus.STARTING
+        
+        # Kết nối PLC nếu chưa
+        if self._plc_client and not self._plc_client.is_connected:
+            self._plc_client.connect()
         
         # Start threads
         self._capture_thread = threading.Thread(
@@ -265,6 +355,10 @@ class OptimizedCameraWorker:
             if self._cap:
                 self._cap.release()
                 self._cap = None
+        
+        # Disconnect PLC
+        if self._plc_client:
+            self._plc_client.disconnect()
         
         # Reset state
         self.person_alarm_active = False
@@ -437,9 +531,12 @@ class OptimizedCameraWorker:
                     if self._status != WorkerStatus.RUNNING:
                         self._status = WorkerStatus.RUNNING
                     
-                    # ===== ATOMIC FRAME UPDATE (không copy) =====
+                    # Vẽ ROI lên frame ngay cả khi chưa có detection (để ROI luôn hiển thị)
+                    frame_with_roi = self._draw_roi_on_frame(frame.copy())
+                    
+                    # ===== ATOMIC FRAME UPDATE (với ROI) =====
                     with self._display_frame_lock:
-                        self._display_frame = frame
+                        self._display_frame = frame_with_roi
                     
                     # Put to detection queue (không block)
                     try:
@@ -510,6 +607,18 @@ class OptimizedCameraWorker:
                 # Detect coal blockage
                 coal_blocked, coal_ratio = self._detect_coal_blockage(frame, result)
                 
+                # Detect person
+                person_detected = self._detect_person(frame, result)
+                self.last_person_detected = person_detected
+                self._update_person_alarm_state(person_detected, frame)
+                
+                # Vẽ segment lên frame nếu có phát hiện
+                display_frame = self._draw_segments_on_frame(frame.copy(), result)
+                
+                # Update display frame với segment
+                with self._display_frame_lock:
+                    self._display_frame = display_frame
+                
                 # Store result
                 with self._latest_result_lock:
                     self._latest_result = (frame.copy(), result, coal_blocked, coal_ratio)
@@ -578,6 +687,8 @@ class OptimizedCameraWorker:
                     if not self.coal_alarm_active:
                         self.coal_alarm_active = True
                         self._alert("coal", True, coal_ratio)
+                        # Gửi PLC và lưu log/ảnh
+                        self._handle_coal_alarm(frame, coal_ratio, True)
                     self._coal_consecutive_count = 0
                     return True, coal_ratio
             else:
@@ -587,12 +698,162 @@ class OptimizedCameraWorker:
                     if self.coal_alarm_active:
                         self.coal_alarm_active = False
                         self._alert("coal", False, coal_ratio)
+                        # Tắt PLC alarm
+                        self._handle_coal_alarm(frame, coal_ratio, False)
             
             return False, coal_ratio
             
         except Exception as e:
             print(f"Camera {self.camera_id} coal detection error: {e}")
             return False, 0.0
+    
+    def _update_person_alarm_state(self, person_detected: bool, frame: np.ndarray) -> None:
+        """Cập nhật trạng thái alarm người"""
+        if not self.config.enable_person:
+            return
+        
+        if person_detected:
+            self._person_no_detection_count = 0
+            self._person_consecutive_count += 1
+            
+            if self._person_consecutive_count >= self.config.person_consecutive_threshold:
+                if not self.person_alarm_active:
+                    self.person_alarm_active = True
+                    self._alert("person", True, 0)
+                    # Gửi PLC và lưu log/ảnh
+                    self._handle_person_alarm(frame, True)
+                self._person_consecutive_count = 0
+        else:
+            self._person_no_detection_count += 1
+            if self._person_no_detection_count >= self.config.person_no_detection_threshold:
+                self._person_consecutive_count = 0
+                if self.person_alarm_active:
+                    self.person_alarm_active = False
+                    self._alert("person", False, 0)
+                    # Tắt PLC alarm
+                    self._handle_person_alarm(frame, False)
+    
+    def _detect_person(self, frame: np.ndarray, result: Any) -> bool:
+        """Phát hiện người trong ROI"""
+        if not self.config.enable_person:
+            return False
+        
+        try:
+            h, w = frame.shape[:2]
+            roi_person = self._scale_roi(self.config.roi_person, w, h)
+            
+            if not roi_person or result is None or result.boxes is None:
+                return False
+            
+            # Create ROI mask
+            roi_mask = np.zeros((h, w), dtype=np.uint8)
+            roi_polygon = np.array(roi_person, dtype=np.int32)
+            cv2.fillPoly(roi_mask, [roi_polygon], 255)
+            
+            boxes = result.boxes
+            masks = result.masks
+            
+            # Check if any person is in ROI
+            for i in range(len(boxes)):
+                cls_id = int(boxes.cls[i])
+                if cls_id == self.person_class_id:
+                    if masks is not None and i < len(masks.data):
+                        # Check mask intersection
+                        mask_data = masks.data[i].cpu().numpy()
+                        mask_resized = cv2.resize(mask_data, (w, h), interpolation=cv2.INTER_NEAREST)
+                        mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+                        intersection = cv2.bitwise_and(mask_binary, roi_mask)
+                        if cv2.countNonZero(intersection) > 0:
+                            return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"Camera {self.camera_id} person detection error: {e}")
+            return False
+    
+    def _draw_segments_on_frame(self, frame: np.ndarray, result: Any) -> np.ndarray:
+        """Vẽ segment người và than lên frame (tham khảo coal_12_12_v1.py)"""
+        if result is None or result.masks is None or result.boxes is None:
+            # Vẫn vẽ ROI ngay cả khi không có detection
+            return self._draw_roi_on_frame(frame)
+        
+        h, w = frame.shape[:2]
+        display_frame = frame.copy()
+        
+        boxes = result.boxes
+        masks = result.masks
+        
+        # Vẽ segment cho từng detection
+        for i in range(len(boxes)):
+            cls_id = int(boxes.cls[i])
+            
+            if i >= len(masks.data):
+                continue
+            
+            # Lấy bounding box
+            x1, y1, x2, y2 = boxes.xyxy[i]
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            conf = float(boxes.conf[i])
+            
+            # Lấy mask
+            mask_data = masks.data[i].cpu().numpy()
+            mask_resized = cv2.resize(mask_data, (w, h), interpolation=cv2.INTER_NEAREST)
+            mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+            
+            # Màu theo class
+            if cls_id == self.person_class_id:
+                # Người: vẽ bounding box và segment
+                color = (0, 255, 0)  # Xanh lá
+                alpha = 0.3
+                
+                # Vẽ bounding box cho người
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                
+            elif cls_id == self.coal_class_id:
+                # Than: CHỈ vẽ segment (không vẽ bounding box)
+                color = (0, 0, 255)  # Đỏ
+                alpha = 0.3
+            else:
+                continue
+            
+            # Tô màu overlay cho segment
+            colored_mask = np.zeros_like(display_frame)
+            colored_mask[mask_binary > 0] = color
+            # Blend segment với alpha
+            mask_3channel = np.stack([mask_binary, mask_binary, mask_binary], axis=2) / 255.0
+            display_frame = (display_frame * (1 - mask_3channel * alpha) + colored_mask * (mask_3channel * alpha)).astype(np.uint8)
+            
+            # Vẽ viền contour cho segment
+            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(display_frame, contours, -1, color, 2)
+        
+        # Vẽ ROI lên frame (sau khi vẽ segment)
+        display_frame = self._draw_roi_on_frame(display_frame)
+        
+        return display_frame
+    
+    def _draw_roi_on_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Vẽ ROI người và than lên frame"""
+        h, w = frame.shape[:2]
+        display_frame = frame.copy()
+        
+        # Scale ROI theo kích thước frame
+        roi_person = self._scale_roi(self.config.roi_person, w, h)
+        roi_coal = self._scale_roi(self.config.roi_coal, w, h)
+        
+        # Vẽ ROI người (màu vàng)
+        if roi_person and len(roi_person) >= 3:
+            pts = np.array(roi_person, dtype=np.int32)
+            cv2.polylines(display_frame, [pts], True, (0, 255, 255), 2)
+        
+        # Vẽ ROI than (màu đỏ)
+        if roi_coal and len(roi_coal) >= 3:
+            pts = np.array(roi_coal, dtype=np.int32)
+            cv2.polylines(display_frame, [pts], True, (0, 0, 255), 2)
+        
+        return display_frame
     
     def _scale_roi(self, roi_points: List[Tuple[int, int]], 
                    target_w: int, target_h: int) -> List[Tuple[int, int]]:
@@ -620,4 +881,69 @@ class OptimizedCameraWorker:
             "coal_alarm": self.coal_alarm_active,
             "video_info": self._video_info,
         }
+    
+    def _handle_coal_alarm(self, frame: np.ndarray, coal_ratio: float, is_active: bool) -> None:
+        """Xử lý cảnh báo than: gửi PLC và lưu log/ảnh"""
+        try:
+            # Gửi PLC
+            if self._alarm_manager:
+                if is_active:
+                    self._alarm_manager.set_coal_alarm(True)
+                else:
+                    self._alarm_manager.set_coal_alarm(False)
+            
+            # Lưu log và ảnh
+            if is_active and self._alert_logger and self._image_saver:
+                # Lưu log text
+                self._alert_logger.log_coal_alert(
+                    coal_ratio=coal_ratio,
+                    threshold=self.config.coal_ratio_threshold,
+                    force=True
+                )
+                
+                # Lưu ảnh
+                roi_person = self._scale_roi(self.config.roi_person, frame.shape[1], frame.shape[0])
+                roi_coal = self._scale_roi(self.config.roi_coal, frame.shape[1], frame.shape[0])
+                self._image_saver.save_coal_alert(
+                    frame=frame,
+                    roi_person=roi_person,
+                    roi_coal=roi_coal,
+                    coal_ratio=coal_ratio,
+                    threshold=self.config.coal_ratio_threshold,
+                    force=True
+                )
+        except Exception as e:
+            self._log(f"❌ Camera {self.camera_id}: Lỗi xử lý coal alarm - {str(e)}")
+    
+    def _handle_person_alarm(self, frame: np.ndarray, is_active: bool) -> None:
+        """Xử lý cảnh báo người: gửi PLC và lưu log/ảnh"""
+        try:
+            # Gửi PLC
+            if self._alarm_manager:
+                if is_active:
+                    self._alarm_manager.set_person_alarm(True)
+                else:
+                    self._alarm_manager.set_person_alarm(False)
+            
+            # Lưu log và ảnh
+            if is_active and self._alert_logger and self._image_saver:
+                # Lưu log text
+                self._alert_logger.log_person_alert(
+                    frames_detected=self._person_consecutive_count,
+                    threshold=self.config.person_consecutive_threshold,
+                    force=True
+                )
+                
+                # Lưu ảnh
+                roi_person = self._scale_roi(self.config.roi_person, frame.shape[1], frame.shape[0])
+                roi_coal = self._scale_roi(self.config.roi_coal, frame.shape[1], frame.shape[0])
+                self._image_saver.save_person_alert(
+                    frame=frame,
+                    roi_person=roi_person,
+                    roi_coal=roi_coal,
+                    consecutive_count=self._person_consecutive_count,
+                    force=True
+                )
+        except Exception as e:
+            self._log(f"❌ Camera {self.camera_id}: Lỗi xử lý person alarm - {str(e)}")
 
