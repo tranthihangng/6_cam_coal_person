@@ -167,6 +167,13 @@ class ProductionMultiCameraApp:
             
             self._models_loaded = True
             self._log(f"✅ Đã load {success_count} model(s)")
+            
+            # Verify và hiển thị GPU status
+            try:
+                self._model_loader.print_gpu_status()
+            except Exception as e:
+                self._log(f"⚠️ Không thể check GPU status: {e}")
+            
             return True
             
         except Exception as e:

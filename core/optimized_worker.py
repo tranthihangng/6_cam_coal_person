@@ -194,6 +194,11 @@ class OptimizedCameraWorker:
         self._coal_no_blockage_count = 0
         self._last_coal_ratio = 0.0
         
+        # Cache ROI scaled để tránh tính toán lại mỗi frame
+        self._cached_roi_person: Optional[List[Tuple[int, int]]] = None
+        self._cached_roi_coal: Optional[List[Tuple[int, int]]] = None
+        self._cached_frame_size: Optional[Tuple[int, int]] = None
+        
         # Alarm state
         self.person_alarm_active = False
         self.coal_alarm_active = False
@@ -532,7 +537,8 @@ class OptimizedCameraWorker:
                         self._status = WorkerStatus.RUNNING
                     
                     # Vẽ ROI lên frame ngay cả khi chưa có detection (để ROI luôn hiển thị)
-                    frame_with_roi = self._draw_roi_on_frame(frame.copy())
+                    # Tối ưu: cache ROI scaled, chỉ copy frame khi cần
+                    frame_with_roi = self._draw_roi_on_frame_optimized_cached(frame)
                     
                     # ===== ATOMIC FRAME UPDATE (với ROI) =====
                     with self._display_frame_lock:
@@ -583,19 +589,31 @@ class OptimizedCameraWorker:
                 inference_start = time.time()
                 
                 with self.model_lock:
+                    # TỐI ƯU: Đảm bảo model chạy trên GPU nếu có
+                    import torch
+                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
                     results = self.model.predict(
                         frame,
                         conf=self.config.detection_confidence,
                         verbose=False,
-                        task='segment'
+                        task='segment',
+                        device=device  # Explicit device để đảm bảo dùng GPU
                     )
                 result = results[0] if results else None
                 
                 inference_time_ms = (time.time() - inference_start) * 1000
                 
-                # Log inference time (mỗi 20 lần log 1 lần để tránh spam)
+                # Log inference time và GPU usage (mỗi 20 lần log 1 lần để tránh spam)
                 if self._detection_count % 20 == 0:
-                    self._log(f"📊 Cam {self.camera_id}: Inference {inference_time_ms:.1f}ms")
+                    gpu_info = ""
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            gpu_mem = torch.cuda.memory_allocated() / 1024**2
+                            gpu_info = f" | GPU: {gpu_mem:.0f}MB"
+                    except:
+                        pass
+                    self._log(f"📊 Cam {self.camera_id}: Inference {inference_time_ms:.1f}ms on {device.upper()}{gpu_info}")
                 
                 # Record inference stats
                 self._stats_manager.record_inference(
@@ -834,8 +852,56 @@ class OptimizedCameraWorker:
         
         return display_frame
     
+    def _draw_roi_on_frame_optimized_cached(self, frame: np.ndarray) -> np.ndarray:
+        """Vẽ ROI lên frame (tối ưu - cache ROI scaled, chỉ copy frame)"""
+        h, w = frame.shape[:2]
+        current_size = (w, h)
+        
+        # Kiểm tra xem có cần tính lại ROI không (khi frame size thay đổi)
+        if self._cached_frame_size != current_size:
+            # Tính lại và cache ROI scaled
+            self._cached_roi_person = self._scale_roi(self.config.roi_person, w, h)
+            self._cached_roi_coal = self._scale_roi(self.config.roi_coal, w, h)
+            self._cached_frame_size = current_size
+        
+        # Copy frame (cần thiết để không ảnh hưởng frame gốc)
+        display_frame = frame.copy()
+        
+        # Vẽ ROI người (màu vàng) - dùng cached (không cần tính lại)
+        if self._cached_roi_person and len(self._cached_roi_person) >= 3:
+            pts = np.array(self._cached_roi_person, dtype=np.int32)
+            cv2.polylines(display_frame, [pts], True, (0, 255, 255), 2)
+        
+        # Vẽ ROI than (màu đỏ) - dùng cached (không cần tính lại)
+        if self._cached_roi_coal and len(self._cached_roi_coal) >= 3:
+            pts = np.array(self._cached_roi_coal, dtype=np.int32)
+            cv2.polylines(display_frame, [pts], True, (0, 0, 255), 2)
+        
+        return display_frame
+    
+    def _draw_roi_on_frame_optimized(self, frame: np.ndarray) -> np.ndarray:
+        """Vẽ ROI lên frame (copy frame) - dùng cho detection loop"""
+        h, w = frame.shape[:2]
+        display_frame = frame.copy()
+        
+        # Scale ROI theo kích thước frame
+        roi_person = self._scale_roi(self.config.roi_person, w, h)
+        roi_coal = self._scale_roi(self.config.roi_coal, w, h)
+        
+        # Vẽ ROI người (màu vàng)
+        if roi_person and len(roi_person) >= 3:
+            pts = np.array(roi_person, dtype=np.int32)
+            cv2.polylines(display_frame, [pts], True, (0, 255, 255), 2)
+        
+        # Vẽ ROI than (màu đỏ)
+        if roi_coal and len(roi_coal) >= 3:
+            pts = np.array(roi_coal, dtype=np.int32)
+            cv2.polylines(display_frame, [pts], True, (0, 0, 255), 2)
+        
+        return display_frame
+    
     def _draw_roi_on_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Vẽ ROI người và than lên frame"""
+        """Vẽ ROI người và than lên frame (dùng cho detection loop)"""
         h, w = frame.shape[:2]
         display_frame = frame.copy()
         
@@ -901,17 +967,19 @@ class OptimizedCameraWorker:
                     force=True
                 )
                 
-                # Lưu ảnh
-                roi_person = self._scale_roi(self.config.roi_person, frame.shape[1], frame.shape[0])
-                roi_coal = self._scale_roi(self.config.roi_coal, frame.shape[1], frame.shape[0])
-                self._image_saver.save_coal_alert(
-                    frame=frame,
-                    roi_person=roi_person,
-                    roi_coal=roi_coal,
-                    coal_ratio=coal_ratio,
-                    threshold=self.config.coal_ratio_threshold,
-                    force=True
-                )
+                # Lưu ảnh: lấy frame hiển thị (đã có ROI và segment) để tối ưu
+                display_frame = None
+                with self._display_frame_lock:
+                    if self._display_frame is not None:
+                        display_frame = self._display_frame.copy()
+                
+                if display_frame is not None:
+                    # Lưu frame hiển thị trực tiếp, không vẽ thêm gì
+                    self._image_saver.save_frame_direct(
+                        frame=display_frame,
+                        alert_type="coal_alert",
+                        force=True
+                    )
         except Exception as e:
             self._log(f"❌ Camera {self.camera_id}: Lỗi xử lý coal alarm - {str(e)}")
     
@@ -934,16 +1002,19 @@ class OptimizedCameraWorker:
                     force=True
                 )
                 
-                # Lưu ảnh
-                roi_person = self._scale_roi(self.config.roi_person, frame.shape[1], frame.shape[0])
-                roi_coal = self._scale_roi(self.config.roi_coal, frame.shape[1], frame.shape[0])
-                self._image_saver.save_person_alert(
-                    frame=frame,
-                    roi_person=roi_person,
-                    roi_coal=roi_coal,
-                    consecutive_count=self._person_consecutive_count,
-                    force=True
-                )
+                # Lưu ảnh: lấy frame hiển thị (đã có ROI và segment) để tối ưu
+                display_frame = None
+                with self._display_frame_lock:
+                    if self._display_frame is not None:
+                        display_frame = self._display_frame.copy()
+                
+                if display_frame is not None:
+                    # Lưu frame hiển thị trực tiếp, không vẽ thêm gì
+                    self._image_saver.save_frame_direct(
+                        frame=display_frame,
+                        alert_type="person_alert",
+                        force=True
+                    )
         except Exception as e:
             self._log(f"❌ Camera {self.camera_id}: Lỗi xử lý person alarm - {str(e)}")
 

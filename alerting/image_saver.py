@@ -318,6 +318,42 @@ class ImageSaver:
             print(f"Lỗi lưu ảnh coal alert: {e}")
             return None
     
+    def save_frame_direct(
+        self,
+        frame: np.ndarray,
+        alert_type: str,
+        force: bool = False,
+    ) -> Optional[str]:
+        """Lưu frame trực tiếp (đã có ROI và segment), không vẽ thêm gì - TỐI ƯU
+        
+        Args:
+            frame: Frame đã được vẽ ROI và segment sẵn
+            alert_type: Loại cảnh báo ("person_alert" hoặc "coal_alert")
+            force: Bỏ qua throttling
+            
+        Returns:
+            Đường dẫn file đã lưu hoặc None
+        """
+        if not force and not self._should_save(alert_type):
+            return None
+        
+        if frame is None:
+            return None
+        
+        try:
+            # Lưu frame trực tiếp, không vẽ gì thêm
+            filename = self._generate_filename(alert_type)
+            filepath = self.save_frame(frame, filename, force=True)
+            
+            if filepath:
+                self._save_count[alert_type] = self._save_count.get(alert_type, 0) + 1
+            
+            return filepath
+            
+        except Exception as e:
+            print(f"Lỗi lưu ảnh {alert_type}: {e}")
+            return None
+    
     def get_save_stats(self) -> Dict[str, Any]:
         """Lấy thống kê lưu ảnh"""
         return {
